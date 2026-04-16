@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -96,6 +97,7 @@ GHANANLP_SECONDARY_KEY = os.getenv("GHANANLP_SECONDARY_KEY", "")
 GHANANLP_TRANSLATE_URL = os.getenv("GHANANLP_TRANSLATE_URL", "https://translation-api.ghananlp.org/v1")
 GHANANLP_TTS_URL = os.getenv("GHANANLP_TTS_URL", "https://translation-api.ghananlp.org/tts/v1")
 AMBEE_API_KEY = os.getenv("AMBEE_API_KEY", "")
+HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN", "")
 AMBEE_BASE_URL = os.getenv("AMBEE_BASE_URL", "https://api.ambeedata.com")
 
 set_database_path(DATABASE_PATH)
@@ -516,6 +518,44 @@ async def ghananlp_request(
     raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
 
 
+# --- Google Translate fallback (free, high-quality Ghanaian language support) ---
+
+GOOGLE_LANG_MAP = {
+    "en": "en",
+    "tw": "ak",   # Twi/Akan
+    "ee": "ee",   # Ewe
+    "gaa": "gaa", # Ga
+    "dag": "dag", # Dagbani
+    "ha": "ha",   # Hausa
+    "fat": "ak",  # Fante → Akan (closest)
+    "nzi": "ak",  # Nzema → Akan (closest)
+    "ki": "ki",   # Kikuyu
+}
+
+
+async def google_translate_fallback(text: str, src_lang: str, tgt_lang: str) -> str | None:
+    """Translate using Google Translate free endpoint. High quality for Ghanaian languages."""
+    src_code = GOOGLE_LANG_MAP.get(src_lang, src_lang)
+    tgt_code = GOOGLE_LANG_MAP.get(tgt_lang, tgt_lang)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client": "gtx", "sl": src_code, "tl": tgt_code, "dt": "t", "q": text},
+            )
+            response.raise_for_status()
+            data = response.json()
+            # Response format: [[["translated text","original text",...],...],...]
+            if isinstance(data, list) and data and isinstance(data[0], list):
+                # Concatenate all translated segments
+                result = "".join(segment[0] for segment in data[0] if segment and segment[0])
+                if result and result.lower() != text.lower():
+                    return result
+    except Exception as exc:
+        print(f"[GoogleTranslate] Translation failed: {exc}")
+    return None
+
+
 async def ambee_request(path: str, *, params: dict, timeout: float = 20.0) -> dict:
     if not AMBEE_API_KEY:
         raise HTTPException(
@@ -700,19 +740,30 @@ async def translate_text(request: Request):
     if "-" not in lang:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Translation language pair must be in the form 'en-tw'.")
 
-    translated = await ghananlp_request(
-        "POST",
-        f"{GHANANLP_TRANSLATE_URL.rstrip('/')}/translate",
-        json_body={"in": text, "lang": lang},
-    )
+    src_lang, tgt_lang = lang.split("-", 1)
 
-    if isinstance(translated, str):
-        output = translated
-    else:
-        output = translated.get("out") or translated.get("translation") or translated.get("text")
-    if not output:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="GhanaNLP translation did not return any translated text.")
-    return {"out": output, "translation": output}
+    # Try GhanaNLP first
+    try:
+        translated = await ghananlp_request(
+            "POST",
+            f"{GHANANLP_TRANSLATE_URL.rstrip('/')}/translate",
+            json_body={"in": text, "lang": lang},
+        )
+        if isinstance(translated, str):
+            output = translated
+        else:
+            output = translated.get("out") or translated.get("translation") or translated.get("text")
+        if output:
+            return {"out": output, "translation": output}
+    except Exception as exc:
+        print(f"[Translate] GhanaNLP failed: {exc}, trying NLLB fallback...")
+
+    # Fallback to Google Translate (free, high quality for Ghanaian languages)
+    google_result = await google_translate_fallback(text, src_lang, tgt_lang)
+    if google_result:
+        return {"out": google_result, "translation": google_result}
+
+    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="All translation services failed.")
 
 
 @app.get("/api/tts/languages")
@@ -1672,3 +1723,167 @@ def build_dashboard_stats() -> dict:
 @app.get("/user/dashboard/stats")
 def get_dashboard_stats():
     return {"success": True, "data": build_dashboard_stats()}
+
+
+# ── Market Intelligence ─────────────────────────────────────────────────────
+
+SEED_COMMODITIES = [
+    ("yellow-maize", "Yellow Maize", "Maize", 299.99, "per bag", "stable", "high"),
+    ("white-maize", "White Maize", "Maize", 289.99, "per bag", "rising", "high"),
+    ("rice", "Rice", "Rice", 159.99, "per bag", "stable", "very-high"),
+    ("yam", "Yam", "Yam", 389.99, "per bag", "rising", "high"),
+    ("cassava", "Cassava", "Cassava", 129.99, "per bag", "stable", "moderate"),
+    ("tomatoes", "Tomatoes", "Tomatoes", 149.99, "per crate", "volatile", "high"),
+    ("pepper", "Pepper", "Pepper", 59.99, "per bag", "rising", "high"),
+    ("onion", "Onion", "Onion", 89.99, "per bag", "seasonal", "moderate"),
+    ("plantain", "Plantain", "Plantain", 79.99, "per bunch", "stable", "high"),
+    ("beans", "Beans", "Beans", 199.99, "per bag", "rising", "moderate"),
+    ("soybeans", "Soybeans", "Soybeans", 399.99, "per bag", "stable", "growing"),
+    ("sorghum", "Sorghum", "Sorghum", 189.99, "per bag", "stable", "low"),
+    ("groundnuts", "Groundnuts", "Groundnuts", 249.99, "per bag", "rising", "moderate"),
+    ("cocoa", "Cocoa", "Cocoa", 850.00, "per bag", "volatile", "export"),
+]
+
+SEED_TRENDS = {
+    "yellow-maize": {
+        "6months": [280, 285, 290, 295, 298, 299.99],
+        "seasonal_pattern": "Low during harvest (July-August), High during planting (March-April)",
+        "peak_months": [3, 4, 5],
+        "low_months": [7, 8, 9],
+    },
+    "rice": {
+        "6months": [150, 152, 155, 157, 158, 159.99],
+        "seasonal_pattern": "Stable year-round, slight increase during festivals",
+        "peak_months": [12, 1],
+        "low_months": [6, 7, 8],
+    },
+    "tomatoes": {
+        "6months": [120, 140, 160, 180, 170, 149.99],
+        "seasonal_pattern": "Very volatile, peaks during dry season",
+        "peak_months": [1, 2, 3],
+        "low_months": [6, 7, 8],
+    },
+    "yam": {
+        "6months": [350, 360, 370, 380, 385, 389.99],
+        "seasonal_pattern": "Peaks before harvest, drops after new yam season",
+        "peak_months": [6, 7, 8],
+        "low_months": [9, 10, 11],
+    },
+}
+
+SEED_MARKET_CENTERS = [
+    ("Greater Accra", ["Tema Market", "Kaneshie Market", "Makola Market"], "excellent", 1.1),
+    ("Ashanti", ["Kumasi Central Market", "Kejetia Market"], "good", 1.05),
+    ("Northern", ["Tamale Market", "Yendi Market"], "fair", 0.95),
+    ("Western", ["Takoradi Market", "Tarkwa Market"], "good", 1.02),
+]
+
+
+def seed_market_data() -> None:
+    """Insert default market data if tables are empty."""
+    with get_connection() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM commodities").fetchone()[0]
+        if count > 0:
+            return
+
+        for slug, name, category, price, unit, trend, demand in SEED_COMMODITIES:
+            conn.execute(
+                "INSERT INTO commodities (slug, name, category, price, unit, trend, demand) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (slug, name, category, price, unit, trend, demand),
+            )
+
+        for slug, data in SEED_TRENDS.items():
+            conn.execute(
+                "INSERT INTO commodity_trends (commodity_slug, month_prices_json, seasonal_pattern, peak_months_json, low_months_json) VALUES (?, ?, ?, ?, ?)",
+                (slug, json.dumps(data["6months"]), data["seasonal_pattern"], json.dumps(data["peak_months"]), json.dumps(data["low_months"])),
+            )
+
+        for region, markets, transport, premium in SEED_MARKET_CENTERS:
+            conn.execute(
+                "INSERT INTO market_centers (region, major_markets_json, transport_access, price_premium) VALUES (?, ?, ?, ?)",
+                (region, json.dumps(markets), transport, premium),
+            )
+
+
+seed_market_data()
+
+
+@app.get("/api/market/commodities")
+def get_commodities():
+    with get_connection() as conn:
+        rows = conn.execute("SELECT slug, name, category, price, unit, trend, demand FROM commodities ORDER BY name").fetchall()
+    return {
+        "success": True,
+        "data": {row["slug"]: {"price": row["price"], "unit": row["unit"], "trend": row["trend"], "demand": row["demand"], "name": row["name"], "category": row["category"]} for row in rows},
+    }
+
+
+@app.get("/api/market/commodities/{slug}")
+def get_commodity(slug: str):
+    with get_connection() as conn:
+        row = conn.execute("SELECT slug, name, category, price, unit, trend, demand FROM commodities WHERE slug = ?", (slug,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Commodity not found")
+    return {"success": True, "data": {"price": row["price"], "unit": row["unit"], "trend": row["trend"], "demand": row["demand"], "name": row["name"], "category": row["category"]}}
+
+
+@app.get("/api/market/trends")
+def get_trends():
+    with get_connection() as conn:
+        rows = conn.execute("SELECT commodity_slug, month_prices_json, seasonal_pattern, peak_months_json, low_months_json FROM commodity_trends").fetchall()
+    data = {}
+    for row in rows:
+        data[row["commodity_slug"]] = {
+            "6months": json.loads(row["month_prices_json"]),
+            "seasonal_pattern": row["seasonal_pattern"],
+            "peak_months": json.loads(row["peak_months_json"]),
+            "low_months": json.loads(row["low_months_json"]),
+        }
+    return {"success": True, "data": data}
+
+
+@app.get("/api/market/trends/{slug}")
+def get_trend(slug: str):
+    with get_connection() as conn:
+        row = conn.execute("SELECT commodity_slug, month_prices_json, seasonal_pattern, peak_months_json, low_months_json FROM commodity_trends WHERE commodity_slug = ?", (slug,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Trend data not found")
+    return {
+        "success": True,
+        "data": {
+            "6months": json.loads(row["month_prices_json"]),
+            "seasonal_pattern": row["seasonal_pattern"],
+            "peak_months": json.loads(row["peak_months_json"]),
+            "low_months": json.loads(row["low_months_json"]),
+        },
+    }
+
+
+@app.get("/api/market/regions")
+def get_regions():
+    with get_connection() as conn:
+        rows = conn.execute("SELECT region, major_markets_json, transport_access, price_premium FROM market_centers ORDER BY region").fetchall()
+    data = {}
+    for row in rows:
+        data[row["region"]] = {
+            "major_markets": json.loads(row["major_markets_json"]),
+            "transport_access": row["transport_access"],
+            "price_premium": row["price_premium"],
+        }
+    return {"success": True, "data": data}
+
+
+@app.get("/api/market/regions/{region}")
+def get_region(region: str):
+    with get_connection() as conn:
+        row = conn.execute("SELECT region, major_markets_json, transport_access, price_premium FROM market_centers WHERE region = ?", (region,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Region not found")
+    return {
+        "success": True,
+        "data": {
+            "major_markets": json.loads(row["major_markets_json"]),
+            "transport_access": row["transport_access"],
+            "price_premium": row["price_premium"],
+        },
+    }
