@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -7,7 +8,6 @@ from pathlib import Path
 import httpx
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from .auth import create_access_token, decode_access_token, hash_password, verify_password
@@ -48,7 +48,7 @@ from .schemas import (
     UserResponse,
 )
 from .spreadsheet_parser import (
-    build_calendar_preview_payload,
+    build_calendar_preview_payload_from_files,
     build_advisory_preview_payload,
     build_committed_calendar_payload,
     build_committed_advisory_payload,
@@ -84,6 +84,7 @@ DEBUG = os.getenv("DEBUG", "true").lower() == "true"
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
 FRONTEND_ORIGINS = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",") if origin.strip()]
+LOCAL_DEV_ORIGIN_REGEX = r"https?://(localhost|127\.0\.0\.1)(:\d+)?$" if APP_ENV != "production" else None
 DATABASE_PATH = os.getenv("DATABASE_PATH", str(Path(__file__).resolve().parent.parent / "agromet.db"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -92,10 +93,6 @@ KINDWISE_CROP_HEALTH_API_KEY = os.getenv("KINDWISE_CROP_HEALTH_API_KEY", KINDWIS
 KINDWISE_PLANT_ID_API_KEY = os.getenv("KINDWISE_PLANT_ID_API_KEY", KINDWISE_API_KEY)
 KINDWISE_CROP_HEALTH_URL = os.getenv("KINDWISE_CROP_HEALTH_URL", "https://crop.kindwise.com")
 KINDWISE_PLANT_ID_URL = os.getenv("KINDWISE_PLANT_ID_URL", "https://api.plant.id/v3")
-GHANANLP_PRIMARY_KEY = os.getenv("GHANANLP_PRIMARY_KEY", "")
-GHANANLP_SECONDARY_KEY = os.getenv("GHANANLP_SECONDARY_KEY", "")
-GHANANLP_TRANSLATE_URL = os.getenv("GHANANLP_TRANSLATE_URL", "https://translation-api.ghananlp.org/v1")
-GHANANLP_TTS_URL = os.getenv("GHANANLP_TTS_URL", "https://translation-api.ghananlp.org/tts/v1")
 AMBEE_API_KEY = os.getenv("AMBEE_API_KEY", "")
 HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN", "")
 AMBEE_BASE_URL = os.getenv("AMBEE_BASE_URL", "https://api.ambeedata.com")
@@ -109,6 +106,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
+    allow_origin_regex=LOCAL_DEV_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -120,20 +118,6 @@ FAQ_MESSAGES = {
     "maize-fertilizer": "Use a soil test where possible. A practical starting point is a balanced basal NPK application followed by a nitrogen top-dress at early vegetative growth.",
     "rainy-season-farming": "Prepare fields early, use drainage where needed, and match planting windows to local rainfall onset instead of fixed calendar dates.",
 }
-
-GHANANLP_TTS_SPEAKERS = [
-    {"id": "twi_speaker_4", "language": "tw", "name": "Twi Speaker 4"},
-    {"id": "twi_speaker_5", "language": "tw", "name": "Twi Speaker 5"},
-    {"id": "twi_speaker_6", "language": "tw", "name": "Twi Speaker 6"},
-    {"id": "twi_speaker_7", "language": "tw", "name": "Twi Speaker 7"},
-    {"id": "twi_speaker_8", "language": "tw", "name": "Twi Speaker 8"},
-    {"id": "twi_speaker_9", "language": "tw", "name": "Twi Speaker 9"},
-    {"id": "ewe_speaker_3", "language": "ee", "name": "Ewe Speaker 3"},
-    {"id": "ewe_speaker_4", "language": "ee", "name": "Ewe Speaker 4"},
-    {"id": "kikuyu_speaker_1", "language": "ki", "name": "Kikuyu Speaker 1"},
-    {"id": "kikuyu_speaker_5", "language": "ki", "name": "Kikuyu Speaker 5"},
-]
-
 
 def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     payload = decode_access_token(token, SECRET_KEY)
@@ -463,61 +447,6 @@ def fetch_calendar_activities(connection, calendar_id: int, current_week: int | 
     return [serialize_calendar_activity(row_to_dict(row)) for row in rows]
 
 
-def get_ghananlp_keys() -> list[str]:
-    return [key for key in [GHANANLP_PRIMARY_KEY, GHANANLP_SECONDARY_KEY] if key]
-
-
-async def ghananlp_request(
-    method: str,
-    path: str,
-    *,
-    json_body: dict | None = None,
-    params: dict | None = None,
-    response_type: str = "json",
-    timeout: float = 20.0,
-):
-    keys = get_ghananlp_keys()
-    if not keys:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="GhanaNLP integration is unavailable because no API key is configured.",
-        )
-
-    last_error: Exception | None = None
-    for index, api_key in enumerate(keys):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.request(
-                    method,
-                    path,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Ocp-Apim-Subscription-Key": api_key,
-                    },
-                    json=json_body,
-                    params=params,
-                )
-                response.raise_for_status()
-                if response_type == "bytes":
-                    return response.content
-                if not response.content:
-                    return {}
-                content_type = response.headers.get("content-type", "").lower()
-                if "json" in content_type:
-                    return response.json()
-                return response.text
-        except httpx.HTTPStatusError as exc:
-            last_error = exc
-            if exc.response.status_code not in {401, 403} or index == len(keys) - 1:
-                break
-        except Exception as exc:  # pragma: no cover - defensive proxy handling
-            last_error = exc
-            break
-
-    detail = str(last_error) if last_error else "Unknown GhanaNLP error."
-    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
-
-
 # --- Google Translate fallback (free, high-quality Ghanaian language support) ---
 
 GOOGLE_LANG_MAP = {
@@ -533,27 +462,31 @@ GOOGLE_LANG_MAP = {
 }
 
 
-async def google_translate_fallback(text: str, src_lang: str, tgt_lang: str) -> str | None:
+async def google_translate_with_client(client: httpx.AsyncClient, text: str, src_lang: str, tgt_lang: str) -> str | None:
     """Translate using Google Translate free endpoint. High quality for Ghanaian languages."""
     src_code = GOOGLE_LANG_MAP.get(src_lang, src_lang)
     tgt_code = GOOGLE_LANG_MAP.get(tgt_lang, tgt_lang)
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={"client": "gtx", "sl": src_code, "tl": tgt_code, "dt": "t", "q": text},
-            )
-            response.raise_for_status()
-            data = response.json()
-            # Response format: [[["translated text","original text",...],...],...]
-            if isinstance(data, list) and data and isinstance(data[0], list):
-                # Concatenate all translated segments
-                result = "".join(segment[0] for segment in data[0] if segment and segment[0])
-                if result and result.lower() != text.lower():
-                    return result
+        response = await client.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": src_code, "tl": tgt_code, "dt": "t", "q": text},
+        )
+        response.raise_for_status()
+        data = response.json()
+        # Response format: [[["translated text","original text",...],...],...]
+        if isinstance(data, list) and data and isinstance(data[0], list):
+            # Concatenate all translated segments
+            result = "".join(segment[0] for segment in data[0] if segment and segment[0])
+            if result and result.lower() != text.lower():
+                return result
     except Exception as exc:
         print(f"[GoogleTranslate] Translation failed: {exc}")
     return None
+
+
+async def google_translate_fallback(text: str, src_lang: str, tgt_lang: str) -> str | None:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        return await google_translate_with_client(client, text, src_lang, tgt_lang)
 
 
 async def ambee_request(path: str, *, params: dict, timeout: float = 20.0) -> dict:
@@ -667,9 +600,9 @@ def integrations_status():
                 "cropHealthConfigured": bool(KINDWISE_CROP_HEALTH_API_KEY),
                 "plantIdConfigured": bool(KINDWISE_PLANT_ID_API_KEY),
             },
-            "ghananlp": {
-                "primaryConfigured": bool(GHANANLP_PRIMARY_KEY),
-                "secondaryConfigured": bool(GHANANLP_SECONDARY_KEY),
+            "translation": {
+                "provider": "google-translate-fallback",
+                "serverTtsEnabled": False,
             },
             "ambee": {
                 "configured": bool(AMBEE_API_KEY),
@@ -742,42 +675,66 @@ async def translate_text(request: Request):
 
     src_lang, tgt_lang = lang.split("-", 1)
 
-    # Try GhanaNLP first
-    try:
-        translated = await ghananlp_request(
-            "POST",
-            f"{GHANANLP_TRANSLATE_URL.rstrip('/')}/translate",
-            json_body={"in": text, "lang": lang},
-        )
-        if isinstance(translated, str):
-            output = translated
-        else:
-            output = translated.get("out") or translated.get("translation") or translated.get("text")
-        if output:
-            return {"out": output, "translation": output}
-    except Exception as exc:
-        print(f"[Translate] GhanaNLP failed: {exc}, trying NLLB fallback...")
-
-    # Fallback to Google Translate (free, high quality for Ghanaian languages)
+    # Keep the route stable for older callers and translate through the current provider.
     google_result = await google_translate_fallback(text, src_lang, tgt_lang)
     if google_result:
         return {"out": google_result, "translation": google_result}
 
-    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="All translation services failed.")
+    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Translation service failed.")
+
+
+@app.post("/api/v1/translate/batch")
+async def translate_text_batch(request: Request):
+    payload = dict(await request.json())
+    texts = payload.get("texts")
+    lang = str(payload.get("lang") or "").strip()
+
+    if not isinstance(texts, list) or not texts:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Translation texts must be a non-empty list.")
+    if len(texts) > 100:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Translation batch is limited to 100 texts.")
+    if "-" not in lang:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Translation language pair must be in the form 'en-tw'.")
+
+    src_lang, tgt_lang = lang.split("-", 1)
+    normalized_texts = [str(text or "").strip() for text in texts]
+    unique_texts = list(dict.fromkeys(text for text in normalized_texts if text))
+    translated_by_text: dict[str, str] = {}
+    semaphore = asyncio.Semaphore(8)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        async def translate_one(text: str) -> tuple[str, str | None]:
+            async with semaphore:
+                return text, await google_translate_with_client(client, text, src_lang, tgt_lang)
+
+        pairs = await asyncio.gather(*(translate_one(text) for text in unique_texts))
+
+    for text, translated in pairs:
+        translated_by_text[text] = translated or text
+
+    translations = [translated_by_text.get(text, text) for text in normalized_texts]
+    return {
+        "translations": translations,
+        "provider": "google-translate-fallback",
+        "count": len(translations),
+    }
 
 
 @app.get("/api/tts/languages")
 async def list_tts_languages():
-    languages = await ghananlp_request(
-        "GET",
-        f"{GHANANLP_TRANSLATE_URL.rstrip('/')}/languages",
-    )
-    return languages
+    return [
+        {"code": "en", "language": "en", "name": "English", "source": "browser"},
+        {"code": "tw", "language": "tw", "name": "Twi / Akan", "source": "browser"},
+        {"code": "gaa", "language": "gaa", "name": "Ga", "source": "browser"},
+        {"code": "ee", "language": "ee", "name": "Ewe", "source": "browser"},
+        {"code": "dag", "language": "dag", "name": "Dagbani", "source": "browser"},
+        {"code": "ha", "language": "ha", "name": "Hausa", "source": "browser"},
+    ]
 
 
 @app.get("/api/tts/speakers")
 def list_tts_speakers():
-    return GHANANLP_TTS_SPEAKERS
+    return []
 
 
 @app.post("/api/tts/tts")
@@ -789,14 +746,15 @@ async def synthesize_speech(request: Request):
     if not text:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="TTS text is required.")
 
-    audio = await ghananlp_request(
-        "POST",
-        f"{GHANANLP_TTS_URL.rstrip('/')}/tts",
-        json_body={"text": text, "language": language},
-        response_type="bytes",
-        timeout=30.0,
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "success": False,
+            "fallback": "browser",
+            "message": "Server text-to-speech is disabled. Use browser speech synthesis.",
+            "language": language,
+        },
     )
-    return Response(content=audio, media_type="audio/mpeg")
 
 
 @app.get("/api/ambee/weather/latest/by-lat-lng")
@@ -1073,17 +1031,42 @@ async def upload_weekly_advisory(request: Request, file: UploadFile | None = Fil
     return {"success": True, "data": advisory, "message": "Weekly advisory uploaded successfully."}
 
 
-async def _preview_calendar_upload(file: UploadFile, metadata: dict, calendar_type: str):
+async def _preview_calendar_upload(
+    file: UploadFile,
+    metadata: dict,
+    calendar_type: str,
+    extra_files: list[tuple[str, UploadFile | None]] | None = None,
+):
     if file is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spreadsheet file is required.")
-    contents = await file.read()
-    preview = build_calendar_preview_payload(contents, metadata, calendar_type)
+    file_items = [
+        {
+            "season": metadata.get("primarySeason") or "Major Season",
+            "fileName": file.filename or "",
+            "contents": await file.read(),
+        }
+    ]
+    for season, upload in extra_files or []:
+        if upload is None:
+            continue
+        file_items.append(
+            {
+                "season": season,
+                "fileName": upload.filename or "",
+                "contents": await upload.read(),
+            }
+        )
+    try:
+        preview = build_calendar_preview_payload_from_files(file_items, metadata, calendar_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return {"success": True, "data": preview}
 
 
 @app.post("/api/crop-calendars/preview")
 async def preview_crop_calendar(
     file: UploadFile = File(...),
+    minorFile: UploadFile | None = File(default=None),
     region: str = Form(...),
     district: str = Form(...),
     crop: str = Form(...),
@@ -1100,8 +1083,10 @@ async def preview_crop_calendar(
             "title": title or f"{crop} Calendar",
             "description": description,
             "year": year,
+            "primarySeason": "Major Season",
         },
         "crop-calendar",
+        extra_files=[("Minor Season", minorFile)],
     )
 
 
@@ -1173,7 +1158,10 @@ async def _preview_advisory_upload(file: UploadFile, metadata: dict, advisory_ty
     if file is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Spreadsheet file is required.")
     contents = await file.read()
-    preview = build_advisory_preview_payload(contents, metadata, advisory_type)
+    try:
+        preview = build_advisory_preview_payload(contents, metadata, advisory_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return {"success": True, "data": preview}
 
 

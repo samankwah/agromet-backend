@@ -149,13 +149,47 @@ def build_advisory_preview_payload(contents: bytes, metadata: dict, advisory_typ
 
 
 def build_calendar_preview_payload(contents: bytes, metadata: dict, calendar_type: str) -> dict:
-    workbook = parse_xlsx_workbook(contents)
-    extracted = _build_poultry_calendar_preview(workbook["sheets"], metadata) if calendar_type == "poultry-calendar" else _build_crop_calendar_preview(workbook["sheets"], metadata)
+    return build_calendar_preview_payload_from_files(
+        [{"season": metadata.get("season") or "Calendar", "fileName": metadata.get("fileName") or "", "contents": contents}],
+        metadata,
+        calendar_type,
+    )
+
+
+def build_calendar_preview_payload_from_files(file_items: list[dict], metadata: dict, calendar_type: str) -> dict:
+    workbooks = []
+    sheets = []
+    for file_item in file_items:
+        workbook = parse_xlsx_workbook(file_item["contents"])
+        season = file_item.get("season") or "Calendar"
+        source_file_name = file_item.get("fileName") or ""
+        renamed_sheets = []
+        for sheet in workbook["sheets"]:
+            renamed_sheet = json.loads(json.dumps(sheet))
+            renamed_sheet["originalName"] = sheet["name"]
+            renamed_sheet["season"] = season
+            renamed_sheet["sourceFileName"] = source_file_name
+            renamed_sheet["name"] = season if len(workbook["sheets"]) == 1 else f'{season} - {sheet["name"]}'
+            renamed_sheets.append(renamed_sheet)
+        workbook["sheets"] = renamed_sheets
+        workbook["sheetNames"] = [sheet["name"] for sheet in renamed_sheets]
+        workbooks.append(
+            {
+                "season": season,
+                "fileName": source_file_name,
+                "sheetCount": workbook["sheetCount"],
+                "sheetNames": workbook["sheetNames"],
+            }
+        )
+        sheets.extend(renamed_sheets)
+
+    extracted = _build_poultry_calendar_preview(sheets, metadata) if calendar_type == "poultry-calendar" else _build_crop_calendar_preview(sheets, metadata)
     parse_token = store_preview_payload(
         {
             "entityType": calendar_type,
             "metadata": metadata,
-            "workbook": workbook,
+            "workbooks": workbooks,
+            "sheets": sheets,
             "extracted": extracted,
         }
     )
@@ -163,10 +197,13 @@ def build_calendar_preview_payload(contents: bytes, metadata: dict, calendar_typ
         "parseToken": parse_token,
         "entityType": calendar_type,
         "workbookMeta": {
-            "sheetCount": workbook["sheetCount"],
-            "sheetNames": workbook["sheetNames"],
+            "fileCount": len(workbooks),
+            "sheetCount": len(sheets),
+            "sheetNames": [sheet["name"] for sheet in sheets],
+            "workbooks": workbooks,
         },
-        "parsedSheets": [_sheet_summary(sheet) for sheet in workbook["sheets"]],
+        "parsedSheets": [_sheet_summary(sheet) for sheet in sheets],
+        "sourceSheets": [_sheet_source_preview(sheet) for sheet in sheets],
         "extracted": extracted,
         "warnings": extracted["warnings"],
         "errors": extracted["errors"],
@@ -207,6 +244,18 @@ def _sheet_summary(sheet: dict) -> dict:
             "sections": sheet["sections"],
         },
         "sampleData": sheet["rows"][:3],
+    }
+
+
+def _sheet_source_preview(sheet: dict) -> dict:
+    return {
+        "name": sheet["name"],
+        "originalName": sheet.get("originalName", sheet["name"]),
+        "season": sheet.get("season", ""),
+        "sourceFileName": sheet.get("sourceFileName", ""),
+        "rowCount": sheet.get("grid", {}).get("rowCount", 0),
+        "columnCount": sheet.get("grid", {}).get("columnCount", 0),
+        "rows": sheet.get("grid", {}).get("rows", []),
     }
 
 
@@ -353,12 +402,14 @@ def _resolve_sheet_refs(archive: zipfile.ZipFile) -> list[dict]:
 
 def _parse_sheet(archive: zipfile.ZipFile, shared_strings: list[str], fills: dict[int, str | None], ref: dict) -> dict:
     root = ET.fromstring(archive.read(ref["path"]))
-    rows: list[list[str]] = []
-    colors: list[list[str | None]] = []
+    rows_by_index: dict[int, list[str]] = {}
+    colors_by_index: dict[int, list[str | None]] = {}
+    merge_ranges = _parse_merge_ranges(root)
     max_cols = 0
     filled_cells = 0
 
     for row in root.findall("main:sheetData/main:row", XML_NS):
+        row_index = int(row.attrib.get("r", str(len(rows_by_index) + 1)) or "1") - 1
         row_cells: list[str] = []
         row_colors: list[str | None] = []
         current_col = 0
@@ -378,12 +429,29 @@ def _parse_sheet(archive: zipfile.ZipFile, shared_strings: list[str], fills: dic
             if value:
                 filled_cells += 1
         max_cols = max(max_cols, len(row_cells))
-        rows.append(row_cells)
-        colors.append(row_colors)
+        rows_by_index[row_index] = row_cells
+        colors_by_index[row_index] = row_colors
+
+    for merge_range in merge_ranges:
+        max_cols = max(max_cols, merge_range["right"] + 1)
+
+    max_row_index = max(
+        [*rows_by_index.keys(), *[merge_range["bottom"] for merge_range in merge_ranges]],
+        default=-1,
+    )
+    rows = [rows_by_index.get(index, []) for index in range(max_row_index + 1)]
+    colors = [colors_by_index.get(index, []) for index in range(max_row_index + 1)]
 
     normalized_rows = [row + [""] * (max_cols - len(row)) for row in rows]
     normalized_colors = [row + [None] * (max_cols - len(row)) for row in colors]
-    non_empty_rows = [row for row in normalized_rows if any(str(value).strip() for value in row)]
+    grid = _build_sheet_grid(normalized_rows, normalized_colors, merge_ranges)
+    non_empty_pairs = [
+        (row, color_row)
+        for row, color_row in zip(normalized_rows, normalized_colors)
+        if any(str(value).strip() for value in row) or any(color for color in color_row)
+    ]
+    non_empty_rows = [row for row, _ in non_empty_pairs]
+    non_empty_colors = [color_row for _, color_row in non_empty_pairs]
     headers = non_empty_rows[0] if non_empty_rows else []
     sections = _detect_sections(non_empty_rows)
     return {
@@ -391,7 +459,8 @@ def _parse_sheet(archive: zipfile.ZipFile, shared_strings: list[str], fills: dic
         "headers": headers,
         "rows": non_empty_rows[1:] if len(non_empty_rows) > 1 else [],
         "rawRows": non_empty_rows,
-        "colors": normalized_colors,
+        "colors": non_empty_colors,
+        "grid": grid,
         "filledCells": filled_cells,
         "totalRows": max(0, len(non_empty_rows) - 1),
         "sections": sections,
@@ -404,6 +473,129 @@ def _column_index_from_ref(cell_ref: str) -> int:
     for char in letters:
         index = index * 26 + (ord(char) - 64)
     return max(index - 1, 0)
+
+
+def _cell_ref_to_indices(cell_ref: str) -> tuple[int, int]:
+    letters = "".join(ch for ch in cell_ref if ch.isalpha()).upper()
+    numbers = "".join(ch for ch in cell_ref if ch.isdigit())
+    row_index = int(numbers or "1") - 1
+    col_index = 0
+    for char in letters:
+        col_index = col_index * 26 + (ord(char) - 64)
+    return max(row_index, 0), max(col_index - 1, 0)
+
+
+def _parse_merge_ranges(root: ET.Element) -> list[dict]:
+    ranges = []
+    for merge_cell in root.findall("main:mergeCells/main:mergeCell", XML_NS):
+        ref = merge_cell.attrib.get("ref", "")
+        if ":" not in ref:
+            continue
+        start_ref, end_ref = ref.split(":", 1)
+        top, left = _cell_ref_to_indices(start_ref)
+        bottom, right = _cell_ref_to_indices(end_ref)
+        ranges.append(
+            {
+                "top": min(top, bottom),
+                "left": min(left, right),
+                "bottom": max(top, bottom),
+                "right": max(left, right),
+            }
+        )
+    return ranges
+
+
+def _sheet_used_bounds(rows: list[list[str]], colors: list[list[str | None]], merge_ranges: list[dict]) -> tuple[int, int, int, int] | None:
+    used_rows: set[int] = set()
+    used_cols: set[int] = set()
+
+    for row_index, row in enumerate(rows):
+        color_row = colors[row_index] if row_index < len(colors) else []
+        for col_index, value in enumerate(row):
+            has_value = bool(str(value or "").strip())
+            has_color = col_index < len(color_row) and bool(color_row[col_index])
+            if has_value or has_color:
+                used_rows.add(row_index)
+                used_cols.add(col_index)
+
+    for merge_range in merge_ranges:
+        top_left_value = ""
+        top_left_color = None
+        if merge_range["top"] < len(rows) and merge_range["left"] < len(rows[merge_range["top"]]):
+            top_left_value = str(rows[merge_range["top"]][merge_range["left"]] or "").strip()
+        if merge_range["top"] < len(colors) and merge_range["left"] < len(colors[merge_range["top"]]):
+            top_left_color = colors[merge_range["top"]][merge_range["left"]]
+        if top_left_value or top_left_color:
+            used_rows.update(range(merge_range["top"], merge_range["bottom"] + 1))
+            used_cols.update(range(merge_range["left"], merge_range["right"] + 1))
+
+    if not used_rows or not used_cols:
+        return None
+
+    return min(used_rows), max(used_rows), min(used_cols), max(used_cols)
+
+
+def _build_sheet_grid(rows: list[list[str]], colors: list[list[str | None]], merge_ranges: list[dict]) -> dict:
+    bounds = _sheet_used_bounds(rows, colors, merge_ranges)
+    if bounds is None:
+        return {"rowCount": 0, "columnCount": 0, "rows": []}
+
+    min_row, max_row, min_col, max_col = bounds
+    adjusted_merges = []
+    for merge_range in merge_ranges:
+        if merge_range["bottom"] < min_row or merge_range["top"] > max_row:
+            continue
+        if merge_range["right"] < min_col or merge_range["left"] > max_col:
+            continue
+        adjusted_merges.append(
+            {
+                "top": max(merge_range["top"], min_row) - min_row,
+                "left": max(merge_range["left"], min_col) - min_col,
+                "bottom": min(merge_range["bottom"], max_row) - min_row,
+                "right": min(merge_range["right"], max_col) - min_col,
+            }
+        )
+
+    merge_by_top_left = {(item["top"], item["left"]): item for item in adjusted_merges}
+    covered_cells = set()
+    for merge_range in adjusted_merges:
+        for row_index in range(merge_range["top"], merge_range["bottom"] + 1):
+            for col_index in range(merge_range["left"], merge_range["right"] + 1):
+                if row_index == merge_range["top"] and col_index == merge_range["left"]:
+                    continue
+                covered_cells.add((row_index, col_index))
+
+    grid_rows = []
+    for source_row_index in range(min_row, max_row + 1):
+        row_cells = []
+        row = rows[source_row_index] if source_row_index < len(rows) else []
+        color_row = colors[source_row_index] if source_row_index < len(colors) else []
+        grid_row_index = source_row_index - min_row
+
+        for source_col_index in range(min_col, max_col + 1):
+            grid_col_index = source_col_index - min_col
+            if (grid_row_index, grid_col_index) in covered_cells:
+                row_cells.append({"covered": True})
+                continue
+
+            merge_range = merge_by_top_left.get((grid_row_index, grid_col_index))
+            value = row[source_col_index] if source_col_index < len(row) else ""
+            background = color_row[source_col_index] if source_col_index < len(color_row) else None
+            row_cells.append(
+                {
+                    "value": value,
+                    "background": background,
+                    "colSpan": (merge_range["right"] - merge_range["left"] + 1) if merge_range else 1,
+                    "rowSpan": (merge_range["bottom"] - merge_range["top"] + 1) if merge_range else 1,
+                }
+            )
+        grid_rows.append(row_cells)
+
+    return {
+        "rowCount": len(grid_rows),
+        "columnCount": max_col - min_col + 1,
+        "rows": grid_rows,
+    }
 
 
 def _read_cell_value(cell: ET.Element, shared_strings: list[str]) -> str:

@@ -9,7 +9,7 @@ REST API server for the AgroMet agricultural meteorological advisory platform. H
 - **Database:** SQLite
 - **Auth:** JWT (PyJWT) with OAuth2 bearer tokens
 - **HTTP Client:** httpx (async, for external API calls)
-- **External APIs:** OpenAI, Kindwise (crop health + plant ID), GhanaNLP (translation + TTS), Ambee (weather)
+- **External APIs:** OpenAI, Kindwise (crop health + plant ID), Google Translate fallback, Ambee (weather)
 
 ## API Endpoints
 
@@ -126,7 +126,6 @@ cp .env.example .env
 | `FRONTEND_ORIGINS` | Allowed CORS origins |
 | `OPENAI_API_KEY` | OpenAI API key (chatbot) |
 | `KINDWISE_API_KEY` | Kindwise crop health API key |
-| `GHANANLP_PRIMARY_KEY` | GhanaNLP translation API key |
 | `AMBEE_API_KEY` | Ambee weather data API key |
 
 ### Running
