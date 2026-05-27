@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -57,35 +58,57 @@ from .spreadsheet_parser import (
 )
 
 
-def load_local_env() -> None:
-    backend_root = Path(__file__).resolve().parent.parent
-    env_candidates = [backend_root / ".env", backend_root / ".env.example"]
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
-    for env_path in env_candidates:
-        if not env_path.exists():
+
+def is_serverless_runtime() -> bool:
+    return os.getenv("VERCEL") == "1" or bool(os.getenv("VERCEL_ENV"))
+
+
+def load_env_file(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
             continue
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
-                os.environ[key] = value
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def load_local_env() -> None:
+    if is_serverless_runtime():
+        return
+
+    load_env_file(BACKEND_ROOT / ".env")
+    if os.getenv("APP_ENV", "development").lower() != "production":
+        load_env_file(BACKEND_ROOT / ".env.example")
+
+
+def resolve_database_path(configured_path: str | None) -> str:
+    if is_serverless_runtime():
+        if configured_path and Path(configured_path).is_absolute():
+            return configured_path
+        database_name = Path(configured_path).name if configured_path else "agromet.db"
+        return str(Path(tempfile.gettempdir()) / database_name)
+
+    return configured_path or str(BACKEND_ROOT / "agromet.db")
 
 
 load_local_env()
 
 
 APP_NAME = os.getenv("APP_NAME", "AgroMet Backend")
-APP_ENV = os.getenv("APP_ENV", "development")
-DEBUG = os.getenv("DEBUG", "true").lower() == "true"
+APP_ENV = os.getenv("APP_ENV", "production" if is_serverless_runtime() else "development")
+DEBUG = os.getenv("DEBUG", "false" if APP_ENV == "production" else "true").lower() == "true"
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
 FRONTEND_ORIGINS = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",") if origin.strip()]
 LOCAL_DEV_ORIGIN_REGEX = r"https?://(localhost|127\.0\.0\.1)(:\d+)?$" if APP_ENV != "production" else None
-DATABASE_PATH = os.getenv("DATABASE_PATH", str(Path(__file__).resolve().parent.parent / "agromet.db"))
+DATABASE_PATH = resolve_database_path(os.getenv("DATABASE_PATH"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 KINDWISE_API_KEY = os.getenv("KINDWISE_API_KEY", "")
