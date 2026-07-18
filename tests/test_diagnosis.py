@@ -226,10 +226,14 @@ class DiagnosisApiTests(unittest.TestCase):
         self.assertIn("api.plant.id", FakeAsyncClient.calls[0]["url"])
         self.assertIn("crop.kindwise.com", FakeAsyncClient.calls[1]["url"])
 
-    def test_crop_diagnosis_returns_unavailable_when_crop_missing_and_plant_id_unconfigured(self):
+    def test_crop_diagnosis_uses_crop_health_when_crop_missing_and_plant_id_unconfigured(self):
+        FakeAsyncClient.payloads = [crop_health_payload()]
         with patch("backend.app.main.KINDWISE_CROP_HEALTH_API_KEY", "crop-key"), patch(
             "backend.app.main.KINDWISE_PLANT_ID_API_KEY",
             "",
+        ), patch(
+            "backend.app.diagnosis.httpx.AsyncClient",
+            FakeAsyncClient,
         ):
             response = self.client.post(
                 "/api/crop-diagnosis",
@@ -237,12 +241,16 @@ class DiagnosisApiTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertEqual(body["status"], "unavailable")
-        self.assertEqual(body["source"], "configuration")
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["providerProduct"], "crop.health")
+        self.assertIsNone(body["identificationProduct"])
+        self.assertEqual(len(FakeAsyncClient.calls), 1)
+        self.assertIn("crop.kindwise.com", FakeAsyncClient.calls[0]["url"])
 
-    def test_crop_diagnosis_returns_unavailable_for_unmappable_plant_id_result(self):
+    def test_crop_diagnosis_uses_crop_health_for_unmappable_plant_id_result(self):
         FakeAsyncClient.payloads = [
             plant_id_payload(name="Dioscorea alata", common_names=["yam"]),
+            crop_health_payload(),
         ]
         with patch("backend.app.main.KINDWISE_CROP_HEALTH_API_KEY", "crop-key"), patch(
             "backend.app.main.KINDWISE_PLANT_ID_API_KEY",
@@ -254,8 +262,13 @@ class DiagnosisApiTests(unittest.TestCase):
             response = self.client.post("/api/crop-diagnosis", json={"image": VALID_IMAGE})
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertEqual(body["status"], "unavailable")
-        self.assertEqual(len(FakeAsyncClient.calls), 1)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["providerProduct"], "crop.health")
+        self.assertIsNone(body["identificationProduct"])
+        self.assertEqual(len(FakeAsyncClient.calls), 2)
+        called_urls = [call["url"] for call in FakeAsyncClient.calls]
+        self.assertTrue(any("api.plant.id" in url for url in called_urls))
+        self.assertTrue(any("crop.kindwise.com" in url for url in called_urls))
 
     def test_image_analysis_rejects_unsupported_type(self):
         response = self.client.post(
