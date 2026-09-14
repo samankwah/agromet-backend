@@ -734,82 +734,141 @@ def _parse_agromet_sheet(rows: list[list[str]], sheet_name: str) -> dict:
     return result
 
 
-def _build_agromet_preview(sheets: list[dict], metadata: dict) -> dict:
-    activities = []
-    warnings: list[str] = []
+def _build_sheet_advisory_preview(sheets: list[dict], metadata: dict, *, poultry: bool) -> dict:
+    """One worksheet per activity, parsed by `_parse_agromet_sheet`.
+
+    Crop and poultry advisories are authored on the *same* sheet template — the
+    [ZONE]/[REGION]/[DISTRICT]/[WEEK]/[CROP] header, the nine-parameter
+    [FORECAST]/[IMPLICATION]/[ADVISORY] band, then the summary and SMS rows. The
+    only thing that differs is which metadata codes travel with the upload, so
+    this is one builder with a flag rather than two that drift apart.
+
+    That was not always so. Poultry used to be routed to a separate builder that
+    looked for `parameter / recommended value` rows and `recommendation`
+    sections — the shape of the *generated* template in
+    frontend/src/services/templateGenerationService.js. Real district bulletins
+    are not written that way: they use the sheet template above. Against one of
+    those the old builder found no metrics, no recommendations, and fell back to
+    recording bare sheet names, which is why poultry advisories reached the app
+    with nothing to show.
+
+    The old shape is still accepted, per sheet: where a sheet carries no
+    [FORECAST] band, its key/value and recommendation rows are read instead.
+    Districts that downloaded the generated template should not lose their
+    uploads to a parser that only understands the newer one.
+    """
     parsed_activities: list[dict] = []
+    activities: list[dict] = []
+    advisories: list[dict] = []
+    management_metrics: dict = {}
+    warnings: list[str] = []
 
     for sheet in sheets:
         rows = sheet["rawRows"]
         parsed = _parse_agromet_sheet(rows, sheet["name"])
-        parsed_activities.append(parsed)
 
-        activities.append({
-            "sheetName": sheet["name"],
-            "activity": sheet["name"],
-            "weekLabel": parsed["metadata"].get("week", metadata.get("week") or ""),
-        })
+        # Crop keeps its original unconditional behaviour: every sheet becomes a
+        # parsed activity even if the band came back thin, because a crop
+        # bulletin has no other shape to fall back to.
+        if parsed["weatherParameters"] or not poultry:
+            parsed_activities.append(parsed)
+            activities.append({
+                "sheetName": sheet["name"],
+                "activity": sheet["name"],
+                "weekLabel": parsed["metadata"].get("week", metadata.get("week") or ""),
+            })
+            advisories.append({"sheetName": sheet["name"], "text": parsed.get("summaryBody", "")})
+            continue
 
-    # Use metadata from first sheet if available
+        # Poultry, older generated template.
+        management_metrics.update(_extract_key_value_rows(rows, ["parameter", "recommended value"]))
+        advisories.extend(
+            _extract_section_items(rows, ["recommendation", "recommended action", "action required"], sheet["name"])
+        )
+        sheet_activities = _extract_named_items(rows, ["production stage", "stage", "phase"], sheet["name"])
+        if not sheet_activities:
+            sheet_activities = [{"sheetName": sheet["name"], "activity": sheet["name"], "weekLabel": metadata.get("week") or ""}]
+            warnings.append(
+                f'No forecast band and no production-stage rows found in sheet "{sheet["name"]}". '
+                "Using the sheet name as the stage label."
+            )
+        activities.extend(sheet_activities)
+
     first_parsed = parsed_activities[0] if parsed_activities else {}
     first_meta = first_parsed.get("metadata", {})
 
-    summary = metadata.get("description") or f"Parsed {len(activities)} advisory activities from {len(sheets)} worksheet(s)."
-    return {
-        "title": metadata.get("title") or "Agromet Advisory",
+    if poultry:
+        # The metrics ride in the weather-forecast column because
+        # weekly_advisories has nowhere else to put them. Only do that for a
+        # bulletin that produced no parsed sheets — otherwise the column has to
+        # carry the real parameters, and the two cannot share it. The client
+        # reads string values out of this column as metrics, so `source` and
+        # `parameters` are reserved names there (see weeklyAdvisoryService.ts).
+        weather_forecast = (
+            {"source": "spreadsheet", "parameters": first_parsed.get("weatherParameters", [])}
+            if parsed_activities
+            else management_metrics
+        )
+    else:
+        weather_forecast = {"source": "spreadsheet", "parameters": first_parsed.get("weatherParameters", [])}
+
+    noun = "poultry advisory activities" if poultry else "advisory activities"
+    summary = metadata.get("description") or f"Parsed {len(activities)} {noun} from {len(sheets)} worksheet(s)."
+
+    payload = {
+        "title": metadata.get("title") or ("Poultry Advisory" if poultry else "Agromet Advisory"),
         "description": metadata.get("description") or "",
         "regionCode": metadata.get("regionCode") or first_meta.get("region", ""),
         "districtCode": metadata.get("districtCode") or first_meta.get("district", ""),
-        "commodityCode": metadata.get("commodityCode") or "",
         "crop": metadata.get("commodityName") or metadata.get("commodityCode") or first_meta.get("crop", ""),
-        "weatherForecast": {
-            "source": "spreadsheet",
-            "parameters": first_parsed.get("weatherParameters", []),
-        },
+        # Collected by the upload endpoints and written to weekly_advisories.year,
+        # but never copied across here — the same drop that _coerce_year was
+        # added to fix for calendars.
+        "year": _coerce_year(metadata.get("year")),
+        "weatherForecast": weather_forecast,
         "summary": summary,
         "sheets": [_sheet_summary(sheet) for sheet in sheets],
         "activities": activities,
         "parsedActivities": parsed_activities,
-        "advisories": [{"sheetName": a["activity"], "text": a.get("summaryBody", "")} for a in parsed_activities],
+        "advisories": advisories,
         "warnings": warnings,
         "errors": [],
         "totalRecords": sum(sheet["totalRows"] for sheet in sheets),
     }
+
+    if poultry:
+        payload["poultryTypeCode"] = metadata.get("poultryTypeCode") or ""
+        payload["breedCode"] = metadata.get("breedCode") or ""
+        payload["managementMetrics"] = management_metrics
+        # The bird is the subject, and it arrives in the [CROP] cell.
+        payload["crop"] = payload["crop"] or metadata.get("poultryTypeCode") or ""
+        if not payload["advisories"]:
+            payload["advisories"] = [{"sheetName": sheets[0]["name"] if sheets else "", "text": summary}]
+    else:
+        payload["commodityCode"] = metadata.get("commodityCode") or ""
+
+    return payload
+
+
+def _build_agromet_preview(sheets: list[dict], metadata: dict) -> dict:
+    return _build_sheet_advisory_preview(sheets, metadata, poultry=False)
 
 
 def _build_poultry_preview(sheets: list[dict], metadata: dict) -> dict:
-    management_metrics = {}
-    activities = []
-    advisories = []
-    warnings: list[str] = []
+    return _build_sheet_advisory_preview(sheets, metadata, poultry=True)
 
-    for sheet in sheets:
-        rows = sheet["rawRows"]
-        management_metrics.update(_extract_key_value_rows(rows, ["parameter", "recommended value"]))
-        sheet_activities = _extract_named_items(rows, ["production stage", "stage", "phase"], sheet["name"])
-        if not sheet_activities:
-            sheet_activities = [{"sheetName": sheet["name"], "activity": sheet["name"], "weekLabel": metadata.get("week") or ""}]
-            warnings.append(f'No explicit production-stage rows found in sheet "{sheet["name"]}". Using the sheet name as the stage label.')
-        activities.extend(sheet_activities)
-        advisories.extend(_extract_section_items(rows, ["recommendation", "recommended action", "action required"], sheet["name"]))
 
-    summary = metadata.get("description") or f"Parsed {len(activities)} poultry management stages from {len(sheets)} worksheet(s)."
-    return {
-        "title": metadata.get("title") or "Poultry Advisory",
-        "description": metadata.get("description") or "",
-        "regionCode": metadata.get("regionCode") or "",
-        "districtCode": metadata.get("districtCode") or "",
-        "poultryTypeCode": metadata.get("poultryTypeCode") or "",
-        "breedCode": metadata.get("breedCode") or "",
-        "managementMetrics": management_metrics,
-        "summary": summary,
-        "sheets": [_sheet_summary(sheet) for sheet in sheets],
-        "activities": activities,
-        "advisories": advisories or [{"sheetName": sheets[0]["name"] if sheets else "", "text": summary}],
-        "warnings": warnings,
-        "errors": [],
-        "totalRecords": sum(sheet["totalRows"] for sheet in sheets),
-    }
+def _coerce_year(value) -> int | None:
+    """The upload endpoints accept a `year`, and insert_calendar_from_parsed_payload
+    writes payload["year"] into the calendars table — but the preview builders
+    below never copied it across, so it was silently dropped in between and every
+    calendar landed with year = NULL. Arrives as a string from multipart form data."""
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _build_crop_calendar_preview(sheets: list[dict], metadata: dict) -> dict:
@@ -831,6 +890,7 @@ def _build_crop_calendar_preview(sheets: list[dict], metadata: dict) -> dict:
         "regionCode": metadata.get("region") or metadata.get("regionCode") or "",
         "districtCode": metadata.get("district") or metadata.get("districtCode") or "",
         "crop": metadata.get("crop") or metadata.get("commodity") or "",
+        "year": _coerce_year(metadata.get("year")),
         "calendarType": "seasonal",
         "totalWeeks": total_weeks or 24,
         "activities": activities,
@@ -860,6 +920,7 @@ def _build_poultry_calendar_preview(sheets: list[dict], metadata: dict) -> dict:
         "districtCode": metadata.get("district") or metadata.get("districtCode") or "",
         "crop": metadata.get("poultryType") or metadata.get("commodity") or "poultry",
         "breedType": metadata.get("breedCode") or metadata.get("breedType") or "",
+        "year": _coerce_year(metadata.get("year")),
         "calendarType": "cycle",
         "totalWeeks": total_weeks or 8,
         "activities": activities,

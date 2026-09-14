@@ -1,0 +1,7 @@
+# Test-only dependencies. Install alongside requirements.txt:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# The suite is written in unittest style and runs under either runner --
+# `python -m pytest backend/tests` or `python -m unittest discover -s
+# backend/tests -t .` -- so pytest is a convenience rather than a requirement.
+pytest==8.3.4

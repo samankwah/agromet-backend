@@ -4,3 +4,5 @@ python-multipart==0.0.20
 PyJWT==2.10.1
 httpx==0.28.1
 email-validator==2.3.0
+psycopg[binary]==3.3.5
+psycopg-pool==3.3.1

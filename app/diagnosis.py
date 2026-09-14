@@ -102,6 +102,9 @@ def build_unavailable_diagnosis(message: str, source: str = "unavailable") -> di
         "plant": "Analysis unavailable",
         "disease": "No verified diagnosis",
         "remedy": message,
+        # Present but empty, so a consumer can read `treatmentParts`
+        # unconditionally rather than branching on status first.
+        "treatmentParts": {"immediate": [], "prevention": []},
         "confidence": None,
         "source": source,
         "providerProduct": None,
@@ -144,11 +147,18 @@ def should_use_crop_health(crop: str | None) -> bool:
     return bool(normalized and normalized in CROP_HEALTH_SUPPORTED_CROPS)
 
 
+# Below this the provider is guessing, and a guess dressed as a diagnosis is
+# worse than saying nothing. Named because clients bucket the confidence they
+# are shown, and their lowest bucket has to start exactly here or the two will
+# describe different things.
+MIN_REPORTABLE_CONFIDENCE = 0.45
+
+
 def is_inconclusive_diagnosis(result: dict[str, Any]) -> bool:
     confidence = result.get("confidence")
     if confidence is None:
         return True
-    if confidence < 0.45:
+    if confidence < MIN_REPORTABLE_CONFIDENCE:
         return True
     disease = str(result.get("disease") or "").strip().lower()
     return disease in {
@@ -229,6 +239,34 @@ def _extract_treatment_text(details: dict[str, Any]) -> str:
     if isinstance(description, str) and description.strip():
         return description.strip()
     return "No treatment recommendation is available."
+
+
+def _extract_treatment_parts(details: dict[str, Any]) -> dict[str, list[str]]:
+    """Kindwise's treatment split the way a reader acts on it.
+
+    The provider already separates `prevention` from `biological` and
+    `chemical`; `_extract_treatment_text` above flattens all three into one
+    prose blob for the web client. That blob cannot be un-flattened later
+    without splitting on full stops and hoping, so this returns the structure
+    directly instead.
+
+    The split is by timing, not by method: biological and chemical are both
+    things to do about an infection that is already visible, while prevention
+    is for the seasons after it. A client showing "do this now" wants the
+    former and nothing else.
+    """
+    treatment = details.get("treatment")
+    if not isinstance(treatment, dict):
+        return {"immediate": [], "prevention": []}
+
+    immediate: list[str] = []
+    for key in ("biological", "chemical"):
+        immediate.extend(_normalize_string_list(treatment.get(key)))
+
+    return {
+        "immediate": immediate,
+        "prevention": _normalize_string_list(treatment.get("prevention")),
+    }
 
 
 def _extract_evidence(details: dict[str, Any]) -> list[str]:
@@ -363,6 +401,9 @@ def normalize_kindwise_identification(
         "plant": str(plant).strip(),
         "disease": str(disease).strip(),
         "remedy": _extract_treatment_text(details),
+        # The same advice as `remedy`, kept apart rather than run together.
+        # `remedy` stays exactly as it was: the web client reads it.
+        "treatmentParts": _extract_treatment_parts(details),
         "confidence": confidence,
         "source": "kindwise",
         "providerProduct": provider_product,
